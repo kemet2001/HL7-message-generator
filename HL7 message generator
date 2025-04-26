@@ -1,0 +1,251 @@
+//go:build !windows
+// +build !windows
+
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "math/rand"
+    "path/filepath"
+    "strings"
+    "time"
+
+    "fyne.io/fyne/v2"
+    "fyne.io/fyne/v2/app"
+    "fyne.io/fyne/v2/container"
+    "fyne.io/fyne/v2/dialog"
+    "fyne.io/fyne/v2/widget"
+)
+
+type TemplateStore struct {
+    MSH map[string]string
+    PID map[string]string
+    PV1 map[string]string
+    OBR map[string]string
+    OBX map[string]string
+    NTE map[string]string
+}
+
+type TestPatient struct {
+    Name      string
+    DOB       string
+    NHSNumber string
+    Address   string
+}
+
+var (
+    templates    TemplateStore
+    sendFolder   string
+    sending      bool
+    testPatients []TestPatient
+)
+
+func main() {
+    rand.Seed(time.Now().UnixNano())
+
+    a := app.New()
+    w := a.NewWindow("HL7 NERV Terminal")
+    w.Resize(fyne.NewSize(1200, 900))
+
+    loadTemplates()
+    loadTestPatients()
+
+    mshEntry := widget.NewMultiLineEntry()
+    mshEntry.SetText("MSH|^~\\&|SendingApp|SendingFacility|ReceivingApp|ReceivingFacility|{TIMESTAMP}||ADT^A01|MSGID1234|P|2.3")
+
+    pidEntry := widget.NewMultiLineEntry()
+    pidEntry.SetText("PID|||{NHS_NUMBER}||{NAME}||{DOB}|{ADDRESS}")
+
+    pv1Entry := widget.NewMultiLineEntry()
+    pv1Entry.SetText("PV1||I|Ward^123^A|||ConsultingDoc^Smith|||SUR||||ADM|||VisitNumber12345")
+
+    obrEntry := widget.NewMultiLineEntry()
+    obrEntry.SetText("OBR|1|OrderID|FillerOrderID|Test^BloodTest|||")
+
+    obxEntry := widget.NewMultiLineEntry()
+    obxEntry.SetText("OBX|1|NM|TestResult^Result||Normal|||N")
+
+    nteEntry := widget.NewMultiLineEntry()
+    nteEntry.SetText("NTE|1|L|All observations normal")
+
+    logOutput := widget.NewMultiLineEntry()
+    logOutput.SetPlaceHolder("Transmission log...")
+    logOutput.SetMinRowsVisible(8)
+    logOutput.Disable()
+
+    rateSlider := widget.NewSlider(0.1, 10)
+    rateSlider.Value = 1
+    rateLabel := widget.NewLabel("Messages/sec: 1.0")
+    rateSlider.OnChanged = func(v float64) {
+        rateLabel.SetText(fmt.Sprintf("Messages/sec: %.1f", v))
+    }
+    sliderContainer := container.NewBorder(nil, nil, nil, rateLabel, rateSlider)
+
+    saveMSH := createSaveButton("Save MSH", mshEntry, "MSH")
+    savePID := createSaveButton("Save PID", pidEntry, "PID")
+    savePV1 := createSaveButton("Save PV1", pv1Entry, "PV1")
+    saveOBR := createSaveButton("Save OBR", obrEntry, "OBR")
+    saveOBX := createSaveButton("Save OBX", obxEntry, "OBX")
+    saveNTE := createSaveButton("Save NTE", nteEntry, "NTE")
+
+    randomPID := widget.NewButton("Random Test Patient", func() {
+        if len(testPatients) > 0 {
+            p := randomTestPatient()
+            pid := pidEntry.Text
+            pid = strings.ReplaceAll(pid, "{NHS_NUMBER}", p.NHSNumber)
+            pid = strings.ReplaceAll(pid, "{NAME}", p.Name)
+            pid = strings.ReplaceAll(pid, "{DOB}", p.DOB)
+            pid = strings.ReplaceAll(pid, "{ADDRESS}", p.Address)
+            pidEntry.SetText(pid)
+        }
+    })
+
+    chooseFolder := widget.NewButton("Choose Save Folder", func() {
+        dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
+            if list != nil {
+                sendFolder = list.Path()
+            }
+        }, w)
+    })
+
+    startButton := widget.NewButton("Start Sending", func() {
+        if sendFolder == "" {
+            dialog.ShowError(fmt.Errorf("Please select an output folder first."), w)
+            return
+        }
+        if sending {
+            return
+        }
+        sending = true
+        go sendLoop(mshEntry, pidEntry, pv1Entry, obrEntry, obxEntry, nteEntry, rateSlider, logOutput)
+    })
+
+    stopButton := widget.NewButton("Stop Sending", func() {
+        sending = false
+    })
+
+    top := container.NewVBox(
+        container.NewHBox(saveMSH, savePID, savePV1, saveOBR, saveOBX, saveNTE, randomPID),
+        widget.NewLabel("MSH Segment:"), mshEntry,
+        widget.NewLabel("PID Segment:"), pidEntry,
+        widget.NewLabel("PV1 Segment:"), pv1Entry,
+        widget.NewLabel("OBR Segment:"), obrEntry,
+        widget.NewLabel("OBX Segment:"), obxEntry,
+        widget.NewLabel("NTE Segment:"), nteEntry,
+    )
+
+    controls := container.NewVBox(
+        chooseFolder,
+        sliderContainer,
+        container.NewHBox(startButton, stopButton),
+    )
+
+    content := container.NewVSplit(
+        top,
+        container.NewVSplit(controls, logOutput),
+    )
+
+    w.SetContent(content)
+    w.ShowAndRun()
+}
+
+func sendLoop(mshEntry, pidEntry, pv1Entry, obrEntry, obxEntry, nteEntry *widget.Entry, rateSlider *widget.Slider, logOutput *widget.Entry) {
+    for sending {
+        timestamp := time.Now().Format("20060102150405")
+        p := randomTestPatient()
+
+        pidSegment := pidEntry.Text
+        pidSegment = strings.ReplaceAll(pidSegment, "{NHS_NUMBER}", p.NHSNumber)
+        pidSegment = strings.ReplaceAll(pidSegment, "{NAME}", p.Name)
+        pidSegment = strings.ReplaceAll(pidSegment, "{DOB}", p.DOB)
+        pidSegment = strings.ReplaceAll(pidSegment, "{ADDRESS}", p.Address)
+
+        mshSegment := strings.ReplaceAll(mshEntry.Text, "{TIMESTAMP}", timestamp)
+
+        message := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s", mshSegment, pidSegment, pv1Entry.Text, obrEntry.Text, obxEntry.Text, nteEntry.Text)
+
+        filename := fmt.Sprintf("hl7_message_%s.hl7", timestamp)
+        path := filepath.Join(sendFolder, filename)
+        ioutil.WriteFile(path, []byte(message), 0644)
+
+        logOutput.SetText(logOutput.Text + fmt.Sprintf("\nSaved %s", filename))
+        time.Sleep(time.Duration(float64(time.Second) / rateSlider.Value))
+    }
+}
+
+func createSaveButton(title string, entry *widget.Entry, segmentType string) *widget.Button {
+    return widget.NewButton(title, func() {
+        name := promptSaveName()
+        if name != "" {
+            switch segmentType {
+            case "MSH":
+                templates.MSH[name] = entry.Text
+            case "PID":
+                templates.PID[name] = entry.Text
+            case "PV1":
+                templates.PV1[name] = entry.Text
+            case "OBR":
+                templates.OBR[name] = entry.Text
+            case "OBX":
+                templates.OBX[name] = entry.Text
+            case "NTE":
+                templates.NTE[name] = entry.Text
+            }
+            saveTemplates()
+        }
+    })
+}
+
+func promptSaveName() string {
+    var name string
+    done := make(chan bool)
+    entry := widget.NewEntry()
+
+    dialog.ShowForm("Save Template", "Save", "Cancel", []*widget.FormItem{
+        widget.NewFormItem("Name", entry),
+    }, func(ok bool) {
+        if ok {
+            name = entry.Text
+        }
+        done <- true
+    }, nil)
+
+    <-done
+    return name
+}
+
+func loadTemplates() {
+    templates = TemplateStore{
+        MSH: make(map[string]string),
+        PID: make(map[string]string),
+        PV1: make(map[string]string),
+        OBR: make(map[string]string),
+        OBX: make(map[string]string),
+        NTE: make(map[string]string),
+    }
+    data, err := ioutil.ReadFile("templates.json")
+    if err == nil {
+        json.Unmarshal(data, &templates)
+    }
+}
+
+func saveTemplates() {
+    data, _ := json.MarshalIndent(templates, "", "  ")
+    ioutil.WriteFile("templates.json", data, 0644)
+}
+
+func loadTestPatients() {
+    testPatients = []TestPatient{
+        {"TESTPATIENT^ONE", "1980-01-01", "9876543210", "1 Test Street, London"},
+        {"TESTPATIENT^TWO", "1995-05-23", "9876543211", "2 Example Road, Manchester"},
+        {"TESTPATIENT^THREE", "1978-11-11", "9876543212", "3 Sample Lane, Birmingham"},
+        {"TESTPATIENT^FOUR", "2001-04-18", "9876543213", "4 Mock Avenue, Bristol"},
+        {"TESTPATIENT^FIVE", "1965-07-30", "9876543214", "5 Fake Place, Leeds"},
+    }
+}
+
+func randomTestPatient() TestPatient {
+    return testPatients[rand.Intn(len(testPatients))]
+}
